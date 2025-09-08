@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Рука vs Нейросеть — Камень Ножницы Бумага</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;display:flex;flex-direction:column;align-items:center;gap:8px;background:#0f172a;color:#e6eef8}
+    .stage{position:relative;width:100%;max-width:420px}
+    video,canvas{width:100%;height:auto;border-radius:12px;box-shadow:0 6px 24px rgba(2,6,23,0.6)}
+    #controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+    button{padding:10px 14px;border-radius:10px;border:0;background:#2563eb;color:white;font-weight:600}
+    button.secondary{background:#334155}
+    #info{display:flex;gap:12px;align-items:center;margin-top:8px}
+    #status{background:#061426;padding:8px 12px;border-radius:10px}
+    .big{font-size:20px;font-weight:700}
+    .small{font-size:13px;color:#94a3b8}
+    .overlayLabel{position:absolute;left:10px;top:10px;background:rgba(2,6,23,0.6);padding:8px 10px;border-radius:8px}
+    .scores{display:flex;gap:12px;align-items:center}
+  </style>
+</head>
+<body>
+  <h2 style="margin-top:14px">Рука vs Нейросеть — Камень/Ножницы/Бумага</h2>
+  <div class="stage">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div class="overlayLabel">
+      <div class="big" id="resultText">—</div>
+      <div class="small" id="subText">Нажми Start, покажи жест перед камерой</div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" class="secondary">Stop</button>
+    <button id="showGuidesBtn" class="secondary">Show Guides</button>
+    <button id="resetBtn" class="secondary">Reset Score</button>
+  </div>
+
+  <div id="info">
+    <div id="status">Статус: <span id="statusText">idle</span></div>
+    <div class="scores">
+      <div>Ты: <span id="playerScore">0</span></div>
+      <div>Нейросеть: <span id="aiScore">0</span></div>
+      <div>Ничья: <span id="drawScore">0</span></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.js"></script>
+  <script>
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const ctx = overlay.getContext('2d');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const showGuidesBtn = document.getElementById('showGuidesBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const statusText = document.getElementById('statusText');
+    const resultText = document.getElementById('resultText');
+    const subText = document.getElementById('subText');
+    let model = null;
+    let stream = null;
+    let rafId = null;
+    let showGuides = false;
+    let stableCounter = 0;
+    let lastGesture = null;
+    let playerScore = 0, aiScore = 0, drawScore = 0;
+
+    const STABLE_FRAMES = 12;
+
+    // история ходов игрока
+    let history = [];
+    const HISTORY_LIMIT = 10;
+
+    async function setupCamera(){
+      const constraints = { video: { facingMode: 'user', width: {ideal: 640} } };
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await new Promise(r => video.onloadedmetadata = r);
+      video.play();
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+    }
+
+    function mirrorPoint(p){
+      return [overlay.width - p[0], p[1]];
+    }
+
+    function drawLandmarks(landmarks){
+      ctx.clearRect(0,0,overlay.width,overlay.height);
+      ctx.fillStyle = 'rgba(0,0,0,0.12)';
+      ctx.fillRect(0,0,overlay.width,overlay.height);
+      const fingers = [ [0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20] ];
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+      for(const finger of fingers){
+        ctx.beginPath();
+        for(let i=0;i<finger.length;i++){
+          const p = mirrorPoint(landmarks[finger[i]]);
+          if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]);
+        }
+        ctx.stroke();
+      }
+      for(let i=0;i<landmarks.length;i++){
+        const p = mirrorPoint(landmarks[i]);
+        ctx.beginPath();
+        ctx.fillStyle = 'white';
+        ctx.arc(p[0],p[1],6,0,Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle='rgba(0,0,0,0.6)';
+        ctx.font='12px sans-serif';
+        ctx.fillText(i,p[0]+8,p[1]+4);
+      }
+    }
+
+    function fingerExtended(tip, pip, dip){
+      return tip[1] < pip[1] && tip[1] < dip[1];
+    }
+
+    function detectGesture(landmarks){
+      if(!landmarks || landmarks.length<21) return null;
+      let extended = 0;
+      const index = fingerExtended(landmarks[8], landmarks[6], landmarks[7]);
+      const middle = fingerExtended(landmarks[12], landmarks[10], landmarks[11]);
+      const ring = fingerExtended(landmarks[16], landmarks[14], landmarks[15]);
+      const pinky = fingerExtended(landmarks[20], landmarks[18], landmarks[19]);
+      const thumb = Math.abs(landmarks[4][0] - landmarks[2][0]) > 25;
+
+      if(index) extended++;
+      if(middle) extended++;
+      if(ring) extended++;
+      if(pinky) extended++;
+      if(thumb) extended++;
+
+      if(index && middle && !ring && !pinky) return 'scissors';
+      if(extended >= 4) return 'paper';
+      if(extended <= 1) return 'rock';
+      return null;
+    }
+
+    function aiChoose(){
+      if(history.length < 3){
+        const arr = ['rock','paper','scissors'];
+        return arr[Math.floor(Math.random()*3)];
+      }
+      const counts = {rock:0, paper:0, scissors:0};
+      history.forEach(g => counts[g]++);
+      const most = Object.keys(counts).reduce((a,b)=> counts[a] > counts[b] ? a : b);
+      if(most==='rock') return 'paper';
+      if(most==='paper') return 'scissors';
+      if(most==='scissors') return 'rock';
+    }
+
+    function decide(player, ai){
+      if(player===ai) return 'draw';
+      if((player==='rock' && ai==='scissors') || (player==='paper' && ai==='rock') || (player==='scissors' && ai==='paper')) return 'win';
+      return 'lose';
+    }
+
+    async function loadModel(){
+      statusText.textContent = 'loading model...';
+      model = await handpose.load();
+      statusText.textContent = 'model loaded';
+    }
+
+    async function start(){
+      startBtn.disabled = true;
+      await setupCamera();
+      if(!model) await loadModel();
+      statusText.textContent = 'running';
+      runDetection();
+    }
+
+    function stop(){
+      startBtn.disabled = false;
+      statusText.textContent = 'stopped';
+      if(rafId) cancelAnimationFrame(rafId);
+      if(stream){
+        stream.getTracks().forEach(t=>t.stop());
+        stream = null;
+      }
+      ctx.clearRect(0,0,overlay.width,overlay.height);
+      resultText.textContent = '—';
+      subText.textContent = 'Нажми Start чтобы начать';
+    }
+
+    function showRoundResult(playerGesture, aiGesture, outcome){
+      let t='';
+      if(outcome==='win'){ t = 'Ты выиграл!'; playerScore++; document.getElementById('playerScore').textContent = playerScore; }
+      else if(outcome==='lose'){ t = 'Нейросеть выиграла'; aiScore++; document.getElementById('aiScore').textContent = aiScore; }
+      else { t = 'Ничья'; drawScore++; document.getElementById('drawScore').textContent = drawScore; }
+      resultText.textContent = `${playerGesture}  —  ${aiGesture}`;
+      subText.textContent = t;
+      overlay.animate([{filter:'brightness(1.2)'},{filter:'brightness(1)'}],{duration:300,fill:'forwards'});
+    }
+
+    async function runDetection(){
+      if(!model) return;
+      async function frame(){
+        const predictions = await model.estimateHands(video, true);
+        ctx.clearRect(0,0,overlay.width,overlay.height);
+        if(predictions && predictions.length>0){
+          const hand = predictions[0];
+          const landmarks = hand.landmarks;
+          if(showGuides) drawLandmarks(landmarks);
+          const gesture = detectGesture(landmarks);
+          if(gesture && gesture===lastGesture){
+            stableCounter++;
+          } else if(gesture){
+            stableCounter = 1;
+            lastGesture = gesture;
+          } else {
+            stableCounter = 0;
+            lastGesture = null;
+          }
+          if(stableCounter >= STABLE_FRAMES){
+            const playerGesture = lastGesture;
+            if(history.length >= HISTORY_LIMIT) history.shift();
+            history.push(playerGesture);
+            const aiGesture = aiChoose();
+            const outcome = decide(playerGesture, aiGesture);
+            showRoundResult(playerGesture, aiGesture, outcome);
+            stableCounter = 0;
+            lastGesture = null;
+          } else {
+            resultText.textContent = gesture ? `detected: ${gesture}` : '—';
+            subText.textContent = 'Держи жест неподвижно несколько кадров чтобы зафиксировать';
+          }
+        } else {
+          resultText.textContent = '—';
+          subText.textContent = 'Рука не обнаружена';
+        }
+        rafId = requestAnimationFrame(frame);
+      }
+      frame();
+    }
+
+    startBtn.onclick = start;
+    stopBtn.onclick = stop;
+    showGuidesBtn.onclick = ()=>{ showGuides = !showGuides; showGuidesBtn.textContent = showGuides ? 'Hide Guides' : 'Show Guides'; };
+    resetBtn.onclick = ()=>{ playerScore=0;aiScore=0;drawScore=0;history=[];document.getElementById('playerScore').textContent=0;document.getElementById('aiScore').textContent=0;document.getElementById('drawScore').textContent=0; };
+  </script>
+</body>
+</html>
